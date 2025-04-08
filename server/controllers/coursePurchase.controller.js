@@ -1,11 +1,14 @@
-import Stripe from "stripe";
+import axios from "axios";
 import { Course } from "../models/course.model.js";
 import { CoursePurchase } from "../models/coursePurchase.model.js";
 import { Lecture } from "../models/lecture.model.js";
 import { User } from "../models/user.model.js";
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+const KONNECT_API_KEY = process.env.KONNECT_API_KEY;
+const KONNECT_BASE_URL = process.env.KONNECT_BASE_URL || "https://api.konnect.network";
+const KONNECT_RECEIVER_WALLET_ID = process.env.KONNECT_RECEIVER_WALLET_ID;
 
+// Initialize Konnect payment
 export const createCheckoutSession = async (req, res) => {
   try {
     const userId = req.id;
@@ -22,89 +25,103 @@ export const createCheckoutSession = async (req, res) => {
       status: "pending",
     });
 
-    // Create a Stripe checkout session
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: "inr",
-            product_data: {
-              name: course.courseTitle,
-              images: [course.courseThumbnail],
-            },
-            unit_amount: course.coursePrice * 100, // Amount in paise (lowest denomination)
-          },
-          quantity: 1,
-        },
-      ],
-      mode: "payment",
-      success_url: `http://localhost:5173/course-progress/${courseId}`, // once payment successful redirect to course progress page
-      cancel_url: `http://localhost:5173/course-detail/${courseId}`,
-      metadata: {
-        courseId: courseId,
-        userId: userId,
-      },
-      shipping_address_collection: {
-        allowed_countries: ["IN"], // Optionally restrict allowed countries
-      },
-    });
+    // Prepare Konnect payment request
+    const paymentData = {
+      receiverWalletId: KONNECT_RECEIVER_WALLET_ID,
+      token: "TND", // Assuming transactions are in Tunisian Dinar
+      amount: course.coursePrice * 1000, // Convert to millimes
+      type: "immediate",
+      description: `Payment for course: ${course.courseTitle}`,
+      acceptedPaymentMethods: ["wallet", "bank_card", "e-DINAR"],
+      lifespan: 30, // 30 minutes expiration
+      checkoutForm: true,
+      addPaymentFeesToAmount: false,
+      orderId: newPurchase._id.toString(),
+      webhook: `${process.env.BASE_URL}/api/payments/webhook`,
+      silentWebhook: true,
+      successUrl: `${process.env.FRONTEND_URL}/course-progress/${courseId}`,
+      failUrl: `${process.env.FRONTEND_URL}/course-detail/${courseId}`,
+      theme: "light"
+    };
 
-    if (!session.url) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Error while creating session" });
+    // Get user details if available
+    const user = await User.findById(userId);
+    if (user) {
+      paymentData.firstName = user.firstName || "";
+      paymentData.lastName = user.lastName || "";
+      paymentData.email = user.email || "";
+      paymentData.phoneNumber = user.phoneNumber || "";
     }
 
-    // Save the purchase record
-    newPurchase.paymentId = session.id;
+    // Call Konnect API to initiate payment
+    const response = await axios.post(
+      `${KONNECT_BASE_URL}/payments/init-payment`,
+      paymentData,
+      {
+        headers: {
+          "x-api-key": KONNECT_API_KEY,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    if (!response.data.payUrl) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Error while creating payment session" });
+    }
+
+    // Save the purchase record with Konnect payment reference
+    newPurchase.paymentId = response.data.paymentRef;
     await newPurchase.save();
 
     return res.status(200).json({
       success: true,
-      url: session.url, // Return the Stripe checkout URL
+      url: response.data.payUrl, // Return the Konnect payment URL
     });
   } catch (error) {
-    console.log(error);
+    console.error("Error creating Konnect payment:", error);
+    return res.status(500).json({ message: "Internal server error" });
   }
 };
 
-export const stripeWebhook = async (req, res) => {
-  let event;
-
+// Konnect webhook handler
+export const konnectWebhook = async (req, res) => {
   try {
-    const payloadString = JSON.stringify(req.body, null, 2);
-    const secret = process.env.WEBHOOK_ENDPOINT_SECRET;
+    const { payment_ref } = req.query;
+    
+    if (!payment_ref) {
+      return res.status(400).json({ message: "Missing payment reference" });
+    }
 
-    const header = stripe.webhooks.generateTestHeaderString({
-      payload: payloadString,
-      secret,
-    });
-
-    event = stripe.webhooks.constructEvent(payloadString, header, secret);
-  } catch (error) {
-    console.error("Webhook error:", error.message);
-    return res.status(400).send(`Webhook error: ${error.message}`);
-  }
-
-  // Handle the checkout session completed event
-  if (event.type === "checkout.session.completed") {
-    console.log("check session complete is called");
-
-    try {
-      const session = event.data.object;
-
-      const purchase = await CoursePurchase.findOne({
-        paymentId: session.id,
-      }).populate({ path: "courseId" });
-
-      if (!purchase) {
-        return res.status(404).json({ message: "Purchase not found" });
+    // Get payment details from Konnect
+    const paymentDetails = await axios.get(
+      `${KONNECT_BASE_URL}/payments/${payment_ref}`,
+      {
+        headers: {
+          "x-api-key": KONNECT_API_KEY,
+          "Content-Type": "application/json"
+        }
       }
+    );
 
-      if (session.amount_total) {
-        purchase.amount = session.amount_total / 100;
-      }
+    const payment = paymentDetails.data.payment;
+    
+    // Find the purchase record by orderId (which we set to the purchase _id)
+    const purchase = await CoursePurchase.findById(payment.orderId)
+      .populate({ path: "courseId" });
+
+    if (!purchase) {
+      return res.status(404).json({ message: "Purchase not found" });
+    }
+
+    // Update purchase amount from Konnect response
+    if (payment.amount) {
+      purchase.amount = payment.amount / 1000; // Convert back from millimes
+    }
+
+    // Only process if payment is completed
+    if (payment.status === "completed") {
       purchase.status = "completed";
 
       // Make all lectures visible by setting `isPreviewFree` to true
@@ -120,23 +137,26 @@ export const stripeWebhook = async (req, res) => {
       // Update user's enrolledCourses
       await User.findByIdAndUpdate(
         purchase.userId,
-        { $addToSet: { enrolledCourses: purchase.courseId._id } }, // Add course ID to enrolledCourses
+        { $addToSet: { enrolledCourses: purchase.courseId._id } },
         { new: true }
       );
 
       // Update course to add user ID to enrolledStudents
       await Course.findByIdAndUpdate(
         purchase.courseId._id,
-        { $addToSet: { enrolledStudents: purchase.userId } }, // Add user ID to enrolledStudents
+        { $addToSet: { enrolledStudents: purchase.userId } },
         { new: true }
       );
-    } catch (error) {
-      console.error("Error handling event:", error);
-      return res.status(500).json({ message: "Internal Server Error" });
     }
+
+    return res.status(200).send();
+  } catch (error) {
+    console.error("Error handling Konnect webhook:", error);
+    return res.status(500).json({ message: "Internal server error" });
   }
-  res.status(200).send();
 };
+
+// The following functions remain the same as they don't involve payment processing
 export const getCourseDetailWithPurchaseStatus = async (req, res) => {
   try {
     const { courseId } = req.params;
@@ -147,7 +167,6 @@ export const getCourseDetailWithPurchaseStatus = async (req, res) => {
       .populate({ path: "lectures" });
 
     const purchased = await CoursePurchase.findOne({ userId, courseId });
-    console.log(purchased);
 
     if (!course) {
       return res.status(404).json({ message: "course not found!" });
@@ -155,10 +174,11 @@ export const getCourseDetailWithPurchaseStatus = async (req, res) => {
 
     return res.status(200).json({
       course,
-      purchased: !!purchased, // true if purchased, false otherwise
+      purchased: !!purchased,
     });
   } catch (error) {
     console.log(error);
+    return res.status(500).json({ message: "Internal server error" });
   }
 };
 
@@ -167,15 +187,12 @@ export const getAllPurchasedCourse = async (_, res) => {
     const purchasedCourse = await CoursePurchase.find({
       status: "completed",
     }).populate("courseId");
-    if (!purchasedCourse) {
-      return res.status(404).json({
-        purchasedCourse: [],
-      });
-    }
+    
     return res.status(200).json({
-      purchasedCourse,
+      purchasedCourse: purchasedCourse || [],
     });
   } catch (error) {
     console.log(error);
+    return res.status(500).json({ message: "Internal server error" });
   }
 };
